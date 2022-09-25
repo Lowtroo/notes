@@ -1,0 +1,269 @@
+* 关于POSIX AIO和Linux AIO
+
+** 名词解释
+glibc实现的AIO是根据POSIX.1b标准定义来的，因此大多数时候，大家讨论的POSIX AIO和glibc AIO是同一个东西，实现在用户态。
+与之相对的是KAIO（kernel AIO）或者Linux (native) AIO，这是在Linux内核实现的AIO。
+
+** POSIX AIO
+POSIX AIO 在用户态实现一种多线程阻塞I/O，从而达到在主线程看起来是异步I/O的假象。
+
+它的API可以从[[https://man7.org/linux/man-pages/man7/aio.7.html]]这里查到。
+
+基本使用方式：
+#+begin_src c
+  #define SIZE_TO_READ (100)
+    int main()
+    {
+      int fd;
+      char *buffer;
+      struct aiocb cb;
+      int num;
+
+      if ((fd = open("test.c", O_RDONLY, 0)) == -1) {
+	  perror("Unable to open file.");
+	  return -1;
+      }
+
+      memset(buffer, 0, SIZE_TO_READ + 1);
+      memset(&cb, 0, sizeof(struct aiocb));
+      cb.aio_nbytes = SIZE_TO_READ;
+      cb.aio_fildes = fd;
+      cb.aio_offset = 100;
+      cb.aio_buf = buffer;
+      /* 发起异步读写请求， 这里是读 */
+      if (aio_read(&cb) == -1) {
+	  perror("Unable to create request.");
+	  close(fd);
+	  free(buffer);
+	  return -1;
+      }
+
+      printf("Request enqueued.\n");
+      /* 检查请求状态. 如果返回0表示处理完成；EINPROGRESS表示处理中，期间可以做其他事情 */
+      while (aio_error(&cb) == EINPROGRESS) {
+	  printf("Working...\n");
+	  /* do something */
+	  sleep(1);
+      }
+      /* 检查请求的结果，返回实际的读取字节数表示成功，或者-1表示请求处理失败 */
+      if ((num = aio_return(&cb)) != -1) {
+	  printf("Success return: %d.\n", num);
+	  printf("Data:\n%s\n", buffer);
+      } else {
+	  printf("Error.\n");
+      }
+
+      close(fd);
+      free(buffer);
+      return 0;
+  }
+#+end_src
+
+重点在于aio_read的实现，在glibc源码librt中：
+#+begin_src c
+// */rt/aio_read.c  
+  int
+  __aio_read (struct aiocb *aiocbp)
+  {
+	  return (__aio_enqueue_request ((aiocb_union *) aiocbp, LIO_READ) == NULL
+		  ? -1 : 0);
+  }
+#+end_src
+可以看到这里调用了__aio_enqueue_request函数，从名字可以看出，将请求放入了一个队列中，它的源码在：aio_misc.c, 分析写在了注释里：
+
+#+begin_src c
+
+  // */rt/aio_misc.c
+
+  /* The main function of the async I/O handling.  It enqueues requests
+     and if necessary starts and handles threads.  */
+  struct requestlist *
+  __aio_enqueue_request (aiocb_union *aiocbp, int operation)
+  {
+    int result = 0;
+    int policy, prio;
+    struct sched_param param;
+    struct requestlist *last, *runp, *newp;
+    int running = no;
+
+    if (operation == LIO_SYNC || operation == LIO_DSYNC)
+      aiocbp->aiocb.aio_reqprio = 0;
+    else if (aiocbp->aiocb.aio_reqprio < 0
+  #ifdef AIO_PRIO_DELTA_MAX
+	     || aiocbp->aiocb.aio_reqprio > AIO_PRIO_DELTA_MAX
+  #endif
+	     )
+      {
+	/* Invalid priority value.  */
+	__set_errno (EINVAL);
+	aiocbp->aiocb.__error_code = EINVAL;
+	aiocbp->aiocb.__return_value = -1;
+	return NULL;
+      }
+
+    /* 请求是有优先级的，计算优先级然后决定后面的插入位置  */
+    __pthread_getschedparam (__pthread_self (), &policy, &param);
+    prio = param.sched_priority - aiocbp->aiocb.aio_reqprio;
+
+    /* 有3个线程共享的全局list，这里取得锁才能对list作后续操作  */
+    __pthread_mutex_lock (&__aio_requests_mutex);
+
+    last = NULL;
+    runp = requests;
+    /* 有已经在处理的fd，应该直接加到其所属的线程上，让同一个线程处理相同fd的请求 */
+    while (runp != NULL
+	   && runp->aiocbp->aiocb.aio_fildes < aiocbp->aiocb.aio_fildes)
+      {
+	last = runp;
+	runp = runp->next_fd;
+      }
+
+    /* 从freelist中取得新的元素，来存放新的请求 */
+    newp = get_elem ();
+    if (newp == NULL)
+      {
+	__pthread_mutex_unlock (&__aio_requests_mutex);
+	__set_errno (EAGAIN);
+	return NULL;
+      }
+    newp->aiocbp = aiocbp;
+    newp->waiting = NULL;
+
+    aiocbp->aiocb.__abs_prio = prio;
+    aiocbp->aiocb.__policy = policy;
+    aiocbp->aiocb.aio_lio_opcode = operation;
+    aiocbp->aiocb.__error_code = EINPROGRESS;
+    aiocbp->aiocb.__return_value = 0;
+
+    if (runp != NULL
+	&& runp->aiocbp->aiocb.aio_fildes == aiocbp->aiocb.aio_fildes)
+      {
+
+	      /* 新请求的fd已经在请求队列中了（之前对相同fd做了读写请求，但还没有完成）。此时需要将新的请求加入到那个线程中 */
+
+
+	      /* 根据优先级来加入队列 */
+	last = NULL;
+	while (runp->next_prio != NULL
+	       && runp->next_prio->aiocbp->aiocb.__abs_prio >= prio)
+	  {
+	    last = runp;
+	    runp = runp->next_prio;
+	  }
+
+	newp->next_prio = runp->next_prio;
+	runp->next_prio = newp;
+
+	running = queued;
+      }
+    else
+      {
+	running = yes;
+	/* 否则是新的fd, 直接加入队列即可 */
+	if (last == NULL)
+	  {
+	    newp->last_fd = NULL;
+	    newp->next_fd = requests;
+	    if (requests != NULL)
+	      requests->last_fd = newp;
+	    requests = newp;
+	  }
+	else
+	  {
+	    newp->next_fd = last->next_fd;
+	    newp->last_fd = last;
+	    last->next_fd = newp;
+	    if (newp->next_fd != NULL)
+	      newp->next_fd->last_fd = newp;
+	  }
+
+	newp->next_prio = NULL;
+	last = NULL;
+      }
+
+    if (running == yes)
+      {
+	/* We try to create a new thread for this file descriptor.  The
+	   function which gets called will handle all available requests
+	   for this descriptor and when all are processed it will
+	   terminate.
+
+	   If no new thread can be created or if the specified limit of
+	   threads for AIO is reached we queue the request.  */
+	      /* 如果是新的fd，要尝试为其创建新的线程来处理请求。每个被创建线程会执行相应的读写操作，如果某个fd处理完了所有请求，
+	       会挂起一段时间，并且监听是否有新请求到来，直到终止 */
+
+	/* 没有空闲的线程，但此时可以创建新线程  */
+	if (nthreads < optim.aio_threads && idle_thread_count == 0)
+	  {
+	    pthread_t thid;
+
+	    running = newp->running = allocated;
+
+	    /* 启动新线程  */
+	    result = aio_create_helper_thread (&thid, handle_fildes_io, newp);
+	    if (result == 0)
+	      /* 创建线程成功，记录当前线程数，剩下的交给线程处理即可  */
+	      ++nthreads;
+	    else
+	      {
+		/* 没有可用的线程，这个时候只能加入等待队列了，将状态设置为yes  */
+		running = newp->running = yes;
+
+		if (nthreads == 0)
+		  {
+		    /* 这里没有运行中的线程，也无法创建新线程，直接把请求扔掉。。。  */
+		    __aio_remove_request (last, newp, 0);
+		  }
+		else
+		  result = 0;
+	      }
+	  }
+      }
+
+    /* 加入等待队列 */
+    if (running == yes && result == 0)
+      {
+	add_request_to_runlist (newp);
+
+	/* 前面提到挂起的线程会监听等待队列，如果有新的加入就会重新唤醒，并处理该请求。所以这里直接尝试唤醒一个挂起的线程 */
+	if (idle_thread_count > 0)
+	  __pthread_cond_signal (&__aio_new_request_notification);
+      }
+
+    if (result == 0)
+      newp->running = running;
+    else
+      {
+	/* Something went wrong.  */
+	__aio_free_request (newp);
+	aiocbp->aiocb.__error_code = result;
+	__set_errno (result);
+	newp = NULL;
+      }
+
+    /* Release the mutex.  */
+    __pthread_mutex_unlock (&__aio_requests_mutex);
+
+    return newp;
+  }
+
+#+end_src
+aio_read的流程大概如下：
+1. 异步请求被提交到requests中（一个队列）
+2. 队列是二位结构，相同的fd会被放在同一个子队列里，也就是同fd的请求会被组织在一起
+3. 请求有优先级概念，同一个fd的请求在子队列里会按照优先级排序的，因此也会按照优先级被处理
+4. 线程会随着新的fd加入而动态的增加
+5. 同一个fd的请求会被交给同一个线程处理，线程处理完后会填充aiocb这个结构体，然后触发信号通知。
+
+   
+这里只列出了aio_read的流程，没有列出线程处理的函数，函数本身太长，但实际的流程不复杂：从全局的请求队列中拿新的请求处理，然后根据operation做相应的读或者写，
+如果处理完了，并且等待队列里没有请求，就挂起一段时间并监听等待队列，此时如果有新的请求到来，会重新唤醒。
+注意线程中的读写操作仍然是阻塞的。所以这里的“异步”只能从主线程的视角来看。
+
+它的特点在于：
+1. 可以与任意一种主流的文件系统交互
+2. 可以移植到多个主流OS下（glibc是可移植的）
+3. 即使是buffered data也可以工作（即不开启O_DIRECT 选项）
+缺点在于：预先分配的线程数量会显著地影响其I/O吞吐量，因为每个线程的I/O仍然是阻塞的，可以理解为能同时做的I/O操作数和线程数相同。
+设想：如果两个对于不同硬盘的读写操作被分配到同一个线程上，那么这两个操作没办法同时进行。

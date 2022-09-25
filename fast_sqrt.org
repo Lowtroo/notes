@@ -1,3 +1,6 @@
+#+HUGO_BASE_DIR: /home/memor/Lowtroo.github.io/
+#+HUGO_SECTION: posts
+#+title: 关于Quake3中平方根倒数的计算方法
 #+OPTIONS: tex:t
 #+STARTUP: latexpreview
 * 引
@@ -8,10 +11,12 @@
    任意取一个定义域内的值$x_0$，开始迭代。
    假设当前的近似解为$x_i$，则在点$(x_i,f(x_i))$ 上作$f(x_i)$ 的切线$l$，其与 $x$ 轴的交点记为 $x_{i+1}$ ，那么这是一个更优的近似解。
    切线的代数意义即为函数 $f(x)$ 的导数，则可以得到这样的迭代式：
-   
+
+
    \begin{equation}
    x_{i+1}=x_{i}-\frac{f(x_i)}{f^{'}(x_i)}
    \end{equation}
+
 
    关于其收敛性的证明，请参考[[[[http://staff.science.uva.nl/c.dominik/]]]][这里]
 ** 计算平方根
@@ -20,11 +25,9 @@
    设 $f(x)=x^2-n$ ，求 $f(x)=0$ 的近似解。
    
    按照前文的迭代式，可以得到：
-
    \begin{equation}
    x_{i+1}=x_{i}-\frac{x_{i}^{2}-n}{2x_i}
-   \end{equation}
-
+      \end{equation}
    设定一个合适的精度，经过有限次迭代最终能得到一个近似解
 * 关于Quake3
 ** 背景
